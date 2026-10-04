@@ -1,0 +1,16 @@
+torch>=2.0.0
+transformers>=4.30.0
+numpy>=1.20.0
+
+[dev]
+pytest>=7.0.0
+black>=22.0.0
+flake8>=4.0.0
+mypy>=0.950
+
+[examples]
+python-dotenv>=0.19.0
+huggingface-hub>=0.10.0
+
+[faiss]
+faiss-cpu>=1.7.0

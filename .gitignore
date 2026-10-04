@@ -1,0 +1,21 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.so
+*.pt
+
+# 本地权重、捕获和运行日志不进仓库。数值结果在 GitHub Release。
+reproduce/logs/
+reproduce/results/
+benchmark_area/experiments/latency/captures/
+benchmark_area/experiments/latency/reports/*.csv
+benchmark_area/experiments/**/snapshots/
+benchmark_area/experiments/false_negativity/reports/*.csv
+benchmark_area/experiments/recall/reports/*.csv
+benchmark_area/experiments/threshold_oracle/results/
+benchmark_area/experiments/pruning/results/
+benchmark_area/experiments/score_distribution/reports/
+benchmark_area/experiments/score_distribution/figs/
+benchmark_area/experiments/key_norms/reports/
+benchmark_area/experiments/key_norms/figs/
+benchmark_area/quick_pruning/*.pt

@@ -1,0 +1,358 @@
+import torch
+
+from hira.kernels.triton_search_kernels import (
+    two_level_filter_kernel_batched,
+    three_level_filter_kernel_v1_batched,
+)
+
+
+def _coerce_query(q: torch.Tensor, *, d: int, device: torch.device):
+    if not isinstance(q, torch.Tensor):
+        raise TypeError(f"q must be a torch.Tensor, got {type(q)}")
+    if q.ndim == 4:
+        # cache-style format: (1, H, 1, D)
+        if q.shape[0] != 1 or q.shape[2] != 1:
+            raise ValueError(f"4D query must be (1,H,1,D), got {tuple(q.shape)}")
+        q = q.squeeze(0).squeeze(-2)
+    elif q.ndim != 2:
+        raise ValueError(f"q must be (H,d) or (1,H,1,D), got {tuple(q.shape)}")
+
+    if q.shape[-1] != d:
+        raise ValueError(f"query dim mismatch: expected d={d}, got {q.shape[-1]}")
+
+    q = q.to(device=device).contiguous()
+    if not q.is_cuda:
+        raise ValueError("q must be CUDA")
+    return q
+
+
+def _coerce_q_head_to_kv(q_head_to_kv, *, H_q: int, H_kv: int, device: torch.device):
+    if q_head_to_kv is None:
+        if H_q == H_kv:
+            return torch.arange(H_q, device=device, dtype=torch.long).contiguous()
+        if (H_q % H_kv) != 0:
+            raise ValueError(
+                f"Unsupported head mapping: H_q={H_q} must equal or be divisible by H_kv={H_kv}"
+            )
+        group_size = H_q // H_kv
+        return (
+            torch.arange(H_q, device=device, dtype=torch.long) // group_size
+        ).contiguous()
+
+    if not torch.is_tensor(q_head_to_kv):
+        raise TypeError(
+            f"q_head_to_kv must be a torch.Tensor or None, got {type(q_head_to_kv)}"
+        )
+    m = q_head_to_kv.to(device=device, dtype=torch.long).contiguous().reshape(-1)
+    if m.numel() != H_q:
+        raise ValueError(
+            f"q_head_to_kv length mismatch: expected H_q={H_q}, got {m.numel()}"
+        )
+    if torch.any((m < 0) | (m >= H_kv)):
+        raise ValueError(f"q_head_to_kv values must be in [0, {H_kv - 1}]")
+    return m
+
+
+def _coerce_threshold(t, *, H: int, device: torch.device):
+    if torch.is_tensor(t):
+        t = t.to(device=device, dtype=torch.float32)
+        if t.ndim == 0:
+            t = t.reshape(1)
+        else:
+            t = t.reshape(-1)
+    else:
+        t = torch.tensor([float(t)], device=device, dtype=torch.float32)
+
+    if t.numel() == 1 and H > 1:
+        t = t.expand(H)
+    if t.numel() != H:
+        raise ValueError(f"threshold must be scalar or length H={H}, got {t.numel()}")
+    return t.contiguous()
+
+
+def _coerce_scaling(
+    scaling: torch.Tensor | None, *, H: int, device: torch.device
+) -> torch.Tensor:
+    if scaling is None:
+        return torch.ones((H,), device=device, dtype=torch.float32)
+    if not torch.is_tensor(scaling):
+        raise TypeError(
+            f"scaling must be a torch.Tensor with shape (H,), got {type(scaling)}"
+        )
+    s = scaling.to(device=device, dtype=torch.float32).contiguous().reshape(-1)
+    if s.numel() != H:
+        raise ValueError(f"scaling must have length H={H}, got {s.numel()}")
+    if not bool(torch.isfinite(s).all().item()):
+        raise ValueError("scaling values must be finite")
+    return s.contiguous()
+
+
+def _coerce_out(out, *, H: int, n: int, device: torch.device, dtype: torch.dtype):
+    if out is None:
+        return torch.zeros((H, n), device=device, dtype=dtype)
+
+    if not isinstance(out, torch.Tensor):
+        raise TypeError(f"out must be a torch.Tensor, got {type(out)}")
+    if out.ndim != 2:
+        raise ValueError(f"out must be 2D (H,n), got {tuple(out.shape)}")
+    if out.shape != (H, n):
+        raise ValueError(f"out shape mismatch: expected {(H, n)}, got {out.shape}")
+
+    if not out.is_cuda:
+        raise ValueError("out must be CUDA")
+    return out
+
+
+def _check_layout_3d_last_contiguous(x: torch.Tensor, name: str):
+    if x.stride(-1) != 1:
+        raise ValueError(
+            f"{name} must be contiguous in the last dim; got stride={x.stride()}"
+        )
+
+
+def triton_two_level_filter(
+    K,
+    P,
+    R,
+    q,
+    t,
+    *,
+    branch,
+    BLOCK_C,
+    n_warps=4,
+    out=None,
+    q_head_to_kv=None,
+    scaling: torch.Tensor | None = None,
+):
+    """
+    Multi-head:
+    - K: (H_kv, N, D)
+    - P: (H_kv, M, D)
+    - R: (H_kv, M)
+    - q: (H_q, D) or (1, H_q, 1, D)
+    - out: (H_q, N)
+    - q_head_to_kv: optional (H_q,)
+    """
+    if K.ndim != 3:
+        raise ValueError(f"K must be (H_kv,n,d), got {tuple(K.shape)}")
+    if P.ndim != 3:
+        raise ValueError(f"P must be (H_kv,m,d), got {tuple(P.shape)}")
+    if R.ndim != 2:
+        raise ValueError(f"R must be (H_kv,m), got {tuple(R.shape)}")
+
+    if not (K.is_cuda and P.is_cuda and R.is_cuda):
+        raise ValueError("K, P, R must be CUDA tensors")
+
+    H_kv, n, d = K.shape
+    if n % branch != 0:
+        raise ValueError(f"n must be divisible by branch; got n={n}, branch={branch}")
+    m = n // branch
+
+    if P.shape != (H_kv, m, d):
+        raise ValueError(
+            f"P shape mismatch: expected {(H_kv, m, d)}, got {tuple(P.shape)}"
+        )
+    if R.shape != (H_kv, m):
+        raise ValueError(
+            f"R shape mismatch: expected {(H_kv, m)}, got {tuple(R.shape)}"
+        )
+    if BLOCK_C > branch or (branch % BLOCK_C) != 0:
+        raise ValueError(
+            f"BLOCK_C must divide branch and be <= branch; got {BLOCK_C}, {branch}"
+        )
+
+    _check_layout_3d_last_contiguous(K, "K")
+    _check_layout_3d_last_contiguous(P, "P")
+
+    q = _coerce_query(q, d=d, device=K.device)
+    H_q = q.shape[0]
+    q_head_to_kv = _coerce_q_head_to_kv(
+        q_head_to_kv, H_q=H_q, H_kv=H_kv, device=K.device
+    )
+    t = _coerce_threshold(t, H=H_q, device=K.device)
+    scaling = _coerce_scaling(scaling, H=H_q, device=K.device)
+
+    if q.stride(-1) != 1:
+        raise ValueError(
+            f"q must be contiguous in the last dim; got stride={q.stride()}"
+        )
+
+    out = _coerce_out(out, H=H_q, n=n, device=K.device, dtype=K.dtype)
+
+    grid = (m, H_q)
+    two_level_filter_kernel_batched[grid](
+        K_ptr=K,
+        P_ptr=P,
+        R_ptr=R,
+        q_ptr=q,
+        q_head_to_kv_ptr=q_head_to_kv,
+        out_ptr=out,
+        t_ptr=t,
+        K_h_stride=K.stride(0),
+        K_row_stride=K.stride(1),
+        P_h_stride=P.stride(0),
+        P_row_stride=P.stride(1),
+        R_h_stride=R.stride(0),
+        R_row_stride=R.stride(1),
+        q_h_stride=q.stride(0),
+        q_d_stride=q.stride(1),
+        out_h_stride=out.stride(0),
+        out_row_stride=out.stride(1),
+        t_h_stride=t.stride(0),
+        scaling_ptr=scaling,
+        scaling_h_stride=scaling.stride(0),
+        q2kv_h_stride=q_head_to_kv.stride(0),
+        n_cols=d,
+        BLOCK_C=BLOCK_C,
+        branching_factor=branch,
+        num_warps=n_warps,
+    )
+
+    return out
+
+
+def _prepare_three_level_inputs(
+    K, P1, R1, P2, R2, q, t, *, branch, BLOCK_C, out, q_head_to_kv, scaling
+):
+    if BLOCK_C is None:
+        BLOCK_C = branch
+
+    if K.ndim != 3:
+        raise ValueError(f"K must be (H_kv,n,d), got {tuple(K.shape)}")
+    if P1.ndim != 3:
+        raise ValueError(f"P1 must be (H_kv,n_p1,d), got {tuple(P1.shape)}")
+    if R1.ndim != 2:
+        raise ValueError(f"R1 must be (H_kv,n_p1), got {tuple(R1.shape)}")
+    if P2.ndim != 3:
+        raise ValueError(f"P2 must be (H_kv,n_p2,d), got {tuple(P2.shape)}")
+    if R2.ndim != 2:
+        raise ValueError(f"R2 must be (H_kv,n_p2), got {tuple(R2.shape)}")
+
+    if not (K.is_cuda and P1.is_cuda and R1.is_cuda and P2.is_cuda and R2.is_cuda):
+        raise ValueError("K, P1, R1, P2, R2 must be CUDA tensors")
+
+    H_kv, N_K, d = K.shape
+    if N_K % branch != 0:
+        raise ValueError(
+            f"N_K must be divisible by branch; got N_K={N_K}, branch={branch}"
+        )
+    N_P1 = N_K // branch
+    if N_P1 % branch != 0:
+        raise ValueError(
+            f"N_P1 must be divisible by branch; got N_P1={N_P1}, branch={branch}"
+        )
+    N_P2 = N_P1 // branch
+
+    if P1.shape != (H_kv, N_P1, d):
+        raise ValueError(
+            f"P1 shape mismatch: expected {(H_kv, N_P1, d)}, got {tuple(P1.shape)}"
+        )
+    if R1.shape != (H_kv, N_P1):
+        raise ValueError(
+            f"R1 shape mismatch: expected {(H_kv, N_P1)}, got {tuple(R1.shape)}"
+        )
+    if P2.shape != (H_kv, N_P2, d):
+        raise ValueError(
+            f"P2 shape mismatch: expected {(H_kv, N_P2, d)}, got {tuple(P2.shape)}"
+        )
+    if R2.shape != (H_kv, N_P2):
+        raise ValueError(
+            f"R2 shape mismatch: expected {(H_kv, N_P2)}, got {tuple(R2.shape)}"
+        )
+    if BLOCK_C > branch or (branch % BLOCK_C) != 0:
+        raise ValueError(
+            f"BLOCK_C must divide branch and be <= branch; got {BLOCK_C}, {branch}"
+        )
+
+    _check_layout_3d_last_contiguous(K, "K")
+    _check_layout_3d_last_contiguous(P1, "P1")
+    _check_layout_3d_last_contiguous(P2, "P2")
+
+    q = _coerce_query(q, d=d, device=K.device)
+    H_q = q.shape[0]
+    q_head_to_kv = _coerce_q_head_to_kv(
+        q_head_to_kv, H_q=H_q, H_kv=H_kv, device=K.device
+    )
+    t = _coerce_threshold(t, H=H_q, device=K.device)
+    scaling = _coerce_scaling(scaling, H=H_q, device=K.device)
+    if q.stride(-1) != 1:
+        raise ValueError(
+            f"q must be contiguous in the last dim; got stride={q.stride()}"
+        )
+
+    out = _coerce_out(out, H=H_q, n=N_K, device=K.device, dtype=K.dtype)
+    return H_q, N_P1, N_P2, d, q, t, out, BLOCK_C, q_head_to_kv, scaling
+
+
+def triton_three_level_filter(
+    K,
+    P1,
+    R1,
+    P2,
+    R2,
+    q,
+    t,
+    *,
+    branch,
+    BLOCK_C=None,
+    n_warps=4,
+    out=None,
+    q_head_to_kv=None,
+    scaling: torch.Tensor | None = None,
+):
+    """
+    One-pass three-level traversal.
+    Program granularity: one program per (query-head, P2 node).
+    """
+    H_q, _N_P1, N_P2, d, q, t, out, BLOCK_C, q_head_to_kv, scaling = (
+        _prepare_three_level_inputs(
+            K,
+            P1,
+            R1,
+            P2,
+            R2,
+            q,
+            t,
+            branch=branch,
+            BLOCK_C=BLOCK_C,
+            out=out,
+            q_head_to_kv=q_head_to_kv,
+            scaling=scaling,
+        )
+    )
+
+    grid = (N_P2, H_q)
+    three_level_filter_kernel_v1_batched[grid](
+        K_ptr=K,
+        P1_ptr=P1,
+        R1_ptr=R1,
+        P2_ptr=P2,
+        R2_ptr=R2,
+        q_ptr=q,
+        q_head_to_kv_ptr=q_head_to_kv,
+        out_ptr=out,
+        t_ptr=t,
+        K_h_stride=K.stride(0),
+        K_row_stride=K.stride(1),
+        P1_h_stride=P1.stride(0),
+        P1_row_stride=P1.stride(1),
+        R1_h_stride=R1.stride(0),
+        R1_row_stride=R1.stride(1),
+        P2_h_stride=P2.stride(0),
+        P2_row_stride=P2.stride(1),
+        R2_h_stride=R2.stride(0),
+        R2_row_stride=R2.stride(1),
+        q_h_stride=q.stride(0),
+        q_d_stride=q.stride(1),
+        out_h_stride=out.stride(0),
+        out_row_stride=out.stride(1),
+        t_h_stride=t.stride(0),
+        scaling_ptr=scaling,
+        scaling_h_stride=scaling.stride(0),
+        q2kv_h_stride=q_head_to_kv.stride(0),
+        n_cols=d,
+        branch=branch,
+        BLOCK_C=BLOCK_C,
+        num_warps=n_warps,
+    )
+    return out
